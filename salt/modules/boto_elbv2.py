@@ -474,7 +474,11 @@ def delete_rule(lb_name,
                 protocol,
                 port,
                 condition_type,
-                condition_value):
+                condition_value,
+                region=None,
+                key=None,
+                keyid=None,
+                profile=None):
     ''''
     .. versionadded:: XXXX.XX.XX
 
@@ -497,6 +501,8 @@ def delete_rule(lb_name,
         (bool) - True on success, False on failure.
     '''
 
+    conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
+
     lb_info = conn.describe_load_balancers(Names=[lb_name])
     if not lb_info:
         return (False, 'ALB {0} does not exist'.format(lb_name))
@@ -508,18 +514,21 @@ def delete_rule(lb_name,
 
     listener_arn = False
     for listener in listener_info['Listeners']:
-        if (listener['Port'] == port) and (listener['Protocol'] == protocol):
+        if (listener['Port'] == port) and (listener['Protocol'] == protocol.upper()):
             listener_arn = listener['ListenerArn']
-            listener_name = listener['ListenerName']
     if not listener_arn:
         return (False, 'Listener for {0} port {1} does not exist'.format(protocol, port))
 
     rule_string = '{0} {1}'.format(condition_type, condition_value)
     rule_info = conn.describe_rules(ListenerArn=listener_arn)
     if not rule_info:
-        return (False, 'Rules for listener {0} do not exist'.format(listener_name))
+        return (False, 'Rules for listener {0} do not exist'.format(rule_string))
+
+    rule_arn = False
     for rule in rule_info['Rules']:
-        if (rule['Conditions']['Field'] == condition_type) and (rule['Conditions']['Values'][0] == condition_value):
+        log.error('RULE {0}'.format(rule))
+        if (rule['Priority'] != 'default') and (rule['Conditions'][0]['Field'] == condition_type) and \
+           (rule['Conditions'][0]['Values'][0] == condition_value):
             rule_arn = rule['RuleArn']
     if not rule_arn:
         return (False, 'Rule matching "{0}" does not exist'.format(rule_string))
