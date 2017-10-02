@@ -125,8 +125,14 @@ def create(name,
         security_groups='["mysecgroup2"]' scheme='internal' ip_type='ipv4'
     '''
 
-    subnets = []
+    conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
+    res = exists(name, region, key, keyid, profile)
+    if res.get('error'):
+        return (False, res.get('error'))
+    if res.get('exists'):
+        return (True, 'Application Load Balancer {0} already exists'.format(name))
 
+    subnets = []
     for i in subnet_names:
         resource = __salt__['boto_vpc.get_resource_id']('subnet',
                                                         name=i,
@@ -138,46 +144,44 @@ def create(name,
             return (False, 'Error looking up subnet id: {0}'.format(r['error']))
         if resource['id'] is None:
             return (False, 'Subnet {0} does not exist.'.format(i))
-        subnets.append(r['id'])
+        subnets.append(resource['id'])
 
-    _security_groups = []
+    security_group_ids = []
     if security_groups:
-        _security_groups = __salt__['boto_secgroup.convert_to_group_ids'](
+        security_group_ids = __salt__['boto_secgroup.convert_to_group_ids'](
             security_groups, vpc_name=vpc_name, region=region, key=key,
             keyid=keyid, profile=profile
         )
-        if not _security_groups:
+        if not security_group_ids:
             return (False, 'Security groups {0} do not map to valid security group ids.'.format(security_groups))
-
-    conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
-    if exists(name, region, key, keyid, profile):
-        return (True, 'Application Load Balancer {0} already exists'.format(name))
 
     try:
         if tags is None:
             alb = conn.create_load_balancer(Name=name,
                                             Subnets=subnets,
-                                            SecurityGroups=_security_groups,
+                                            SecurityGroups=security_group_ids,
                                             Scheme=scheme,
                                             IpAddressType=ip_type)
         else:
             alb = conn.create_load_balancer(Name=name,
                                             Subnets=subnets,
-                                            SecurityGroups=_security_groups,
+                                            SecurityGroups=security_group_ids,
                                             Scheme=scheme,
                                             Tags=tags,
                                             IpAddressType=ip_type)
         if alb:
             log.info('Created ALB {0}'.format(name))
-            return True
+            return (True, 'Created ALB {0}'.format(name))
         else:
             log.error('Failed to create ALB {0}'.format(name))
             return (False, 'Failed to create ALB {0} reason: {1}'.format(name, alb))
     except ClientError as error:
+        error_string = 'Failed to create ALB {0}: {1}: {2}'.format(name,
+                                                                   error.response['Error']['Code'],
+                                                                   error.response['Error']['Message'])
         log.debug(error)
-        log.error('Failed to create ALB {0}: {1}: {2}'.format(name,
-                                                              error.response['Error']['Code'],
-                                                              error.response['Error']['Message']))
+        log.error(error_string)
+        return (False, error_string)
 
 
 def delete(name,
@@ -207,22 +211,17 @@ def delete(name,
     '''
 
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
-
-    if not exists(name, region, key, keyid, profile):
-        return True
+    res = exists(name, region, key, keyid, profile)
+    if res.get('error'):
+        return (False, res.get('error'))
+    if not res.get('exists'):
+        return (True, 'Application Load Balancer {0} does not exist'.format(name))
+    lb_arn = res.get('arn')
 
     try:
-        if name.startswith('arn:aws:elasticloadbalancing'):
-            conn.delete_load_balancer(LoadBalancerArn=name)
-            log.info('Deleted ALB {0}'.format(name))
-        else:
-            alb_info = conn.describe_load_balancers(Names=[name])
-            if len(alb_info['LoadBalancers']) != 1:
-                return False
-            arn = alb_info['LoadBalancers'][0]['LoadBalancerArn']
-            conn.delete_load_balancer(LoadBalancerArn=arn)
-            log.info('Deleted ALB {0} ARN {1}'.format(name, arn))
-        return True
+        conn.delete_load_balancer(LoadBalancerArn=lb_arn)
+        log.info('Deleted ALB {0} ARN {1}'.format(name, lb_arn))
+        return (True, 'Deleted ALB {0}'.format(name))
     except ClientError as error:
         error_string = 'Failed to delete ALB {0}: {1}: {2}'.format(name,
                                                                    error.response['Error']['Code'],
@@ -250,6 +249,7 @@ def exists(name,
         salt myminion boto_elbv2.load_balancer_exists arn:aws:elasticloadbalancing:us-west-2:644138682826:loadbalancer/myExternalALB/414788a16b5cf163
         salt myminion boto_elbv2.load_balancer_exists myExternalALB
     '''
+
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
     try:
         if name.startswith('arn:aws:elasticloadbalancing'):
@@ -257,16 +257,78 @@ def exists(name,
         else:
             alb = conn.describe_load_balancers(Names=[name])
         if alb:
-            return True
+            return {'exists': True, 'arn': alb['LoadBalancers'][0]['LoadBalancerArn']}
         else:
-            log.warning('The application load balancer does not exist in region {0}'.format(region))
-            return False
+            return {'exists': False}
     except ClientError as error:
-        log.warning('load_balancers_exists check for {0} returned: {1}'.format(name, error))
-        return False
+        if error.response['Error']['Code'] == 'LoadBalancerNotFound':
+            return {'exists': False}
+
+        log.warning('load_balancer_exists check for {0} returned {1}:{2}'.format(name,
+                                                                                 error.response['Error']['Code'],
+                                                                                 error.response['Error']['Message']))
+        return {'error': 'Connection to AWS failed. Please check that your AWS credentials (region, key, keyid or profile) are correct'}
 
 
-# TODO Add update_attributes so logging can be manipulated
+def update_attribute(lb_name,
+                     attribute=None,
+                     value=None,
+                     region=None,
+                     key=None,
+                     keyid=None,
+                     profile=None):
+    '''
+    .. versionadded:: XXXX.XX.XX
+
+    Update load balancer attribute
+
+    lb_name
+        (string) - The name of the application load balancer (ALB).
+    atribute
+        (string) - The attribute to update
+    value
+        (string) - The value to assign the attribute
+
+        Available Addributes ( as of 10/2017)
+          access_logs.s3.enabled - Indicates whether access logs stored in Amazon S3 are enabled. The value is true or false .
+          access_logs.s3.bucket - The name of the S3 bucket for the access logs. This attribute is required if access logs in Amazon S3 are enabled. The bucket must exist in the same region as the load balancer and have a bucket policy that grants Elastic Load Balancing permission to write to the bucket.
+          access_logs.s3.prefix - The prefix for the location in the S3 bucket. If you don't specify a prefix, the access logs are stored in the root of the bucket.
+          deletion_protection.enabled - Indicates whether deletion protection is enabled. The value is true or false .
+          idle_timeout.timeout_seconds - The idle timeout value, in seconds. The valid range is 1-4000. The default is 60 seconds.
+    '''
+
+    conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
+    res = exists(lb_name, region, key, keyid, profile)
+    if res.get('error'):
+        return (False, res.get('error'))
+    if not res.get('exists'):
+        return (False, 'Application load balancer {0} does not exist'.format(lb_name))
+    lb_arn = res.get('arn')
+
+    if isinstance(value, bool):
+        valuestring = str(value).lower()
+    else:
+        valuestring = str(value)
+    attributes = {}
+    attributes['Key'] = attribute
+    attributes['Value'] = valuestring
+
+    try:
+        result = conn.modify_load_balancer_attributes(LoadBalancerArn=lb_arn,
+                                                      Attributes=[attributes])
+        if result:
+            return (True, 'Attribute {0} updated to {1}'.format(attribute, valuestring))
+        else:
+            log.error('Failed to udpate attribute {0}'.format(attribute))
+            return (False, 'Failed to update attribute {0}'.format(attribute))
+    except ClientError as error:
+        error_string = 'Failed to update attribute "{0}". {1}:{2}'.format(attribute,
+                                                                          error.response['Error']['Code'],
+                                                                          error.response['Error']['Message'])
+        log.debug(error)
+        log.error(error_string)
+        return(False, error_string)
+
 
 def create_listener(lb_name,
                     protocol='HTTPS',
@@ -314,16 +376,13 @@ def create_listener(lb_name,
     if protocol == 'HTTPS' and not cert_arn:
         return (False, 'certificate must be specified for HTTPS')
 
-    if not exists(lb_name, region=region, key=key, keyid=keyid, profile=profile):
-        return (False, 'Application load balancer {0} does not exist'.format(lb_name))
-
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
-
-    lb_info = conn.describe_load_balancers(Names=[lb_name])
-    if not lb_info:
-        return (False, 'ALB {0} does not exist'.format(lb_name))
-
-    lb_arn = lb_info['LoadBalancers'][0]['LoadBalancerArn']
+    res = exists(lb_name, region, key, keyid, profile)
+    if res.get('error'):
+        return (False, res.get('error'))
+    if not res.get('exists'):
+        return (False, 'Application load balancer {0} does not exist'.format(lb_name))
+    lb_arn = res.get('arn')
 
     tg_arn = target_group_exists(default_tg, region, key, keyid, profile)
     if not tg_arn:
@@ -332,7 +391,6 @@ def create_listener(lb_name,
     default_actions = {}
     default_actions['Type'] = 'forward'
     default_actions['TargetGroupArn'] = tg_arn
-
     certificates = {}
     certificates['CertificateArn'] = cert_arn
 
@@ -363,10 +421,12 @@ def create_listener(lb_name,
             log.error('Failed to create listener {0}'.format(listener_string))
             return (False, 'Failed to create listener {0}'.format(listenr_string))
     except ClientError as error:
+        error_string = 'Failed to create listener "{0}". {1}:{2}'.format(listener_string,
+                                                                         error.response['Error']['Code'],
+                                                                         error.response['Error']['Message'])
         log.debug(error)
-        log.error('Failed to create listener {0}  {1}:{2}'.format(listener_string,
-                                                                  error.response['Error']['Code'],
-                                                                  error.response['Error']['Message']))
+        log.error(error_string)
+        return(False, error_string)
 
 
 def create_rule(lb_name,
@@ -415,15 +475,13 @@ def create_rule(lb_name,
 
     '''
 
-    if not exists(lb_name, region, key, keyid, profile):
-        return (False, 'Application load balancer {0} does not exist'.format(lb_name))
-
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
-
-    lb_info = conn.describe_load_balancers(Names=[lb_name])
-    if not lb_info:
-        return (False, 'ALB {0} does not exist'.format(lb_name))
-    lb_arn = lb_info['LoadBalancers'][0]['LoadBalancerArn']
+    res = exists(lb_name, region, key, keyid, profile)
+    if res.get('error'):
+        return (False, res.get('error'))
+    if not res.get('exists'):
+        return (False, 'Application load balancer {0} does not exist'.format(lb_name))
+    lb_arn = res.get('arn')
 
     tg_arn = target_group_exists(target_group, region, key, keyid, profile)
     if not tg_arn:
@@ -503,10 +561,16 @@ def delete_rule(lb_name,
 
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
 
-    lb_info = conn.describe_load_balancers(Names=[lb_name])
-    if not lb_info:
-        return (False, 'ALB {0} does not exist'.format(lb_name))
-    lb_arn = lb_info['LoadBalancers'][0]['LoadBalancerArn']
+    # if conn:
+    #     return(True,'conn is {0}'.format(conn))
+    # return(False,'dummy')
+
+    res = exists(lb_name, region, key, keyid, profile)
+    if res.get('error'):
+        return (False, res.get('error'))
+    if not res.get('exists'):
+        return (False, 'Application load balancer {0} does not exist'.format(lb_name))
+    lb_arn = res.get('arn')
 
     listener_info = conn.describe_listeners(LoadBalancerArn=lb_arn)
     if not listener_info:
@@ -545,7 +609,7 @@ def delete_rule(lb_name,
                                                                      error.response['Error']['Message'])
         log.debug(error)
         log.error(error_string)
-        return (Falise, error_string)
+        return (False, error_string)
 
 
 def create_target_group(name,
@@ -655,8 +719,6 @@ def create_target_group(name,
         log.error(error_string)
         return (False, error_string)
 
-# TODO add update_target_group ( so healthcheck can be manipulated )
-
 
 def delete_target_group(name,
                         region=None,
@@ -683,7 +745,7 @@ def delete_target_group(name,
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
 
     if not target_group_exists(name, region, key, keyid, profile):
-        return True
+        return (True, 'Target group {0} does not exists'.format(name))
 
     try:
         if name.startswith('arn:aws:elasticloadbalancing'):
